@@ -67,14 +67,30 @@ public class VideoOutputManager {
         }
     }
 
-    public void expectSurfaceTextureFrame(long handle, long generation, int width, int height) {
+    public void expectSurfaceTextureFrame(
+            long handle,
+            long generation,
+            int width,
+            int height,
+            int minimumFrameCount
+    ) {
         synchronized (lock) {
             if (videoOutputs.containsKey(handle)) {
                 Objects.requireNonNull(videoOutputs.get(handle)).expectSurfaceTextureFrame(
                         generation,
                         width,
-                        height
+                        height,
+                        minimumFrameCount
                 );
+            }
+        }
+    }
+
+    public void cancelSurfaceTextureFrameExpectation(long handle) {
+        synchronized (lock) {
+            if (videoOutputs.containsKey(handle)) {
+                Objects.requireNonNull(videoOutputs.get(handle))
+                        .cancelSurfaceTextureFrameExpectation();
             }
         }
     }
