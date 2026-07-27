@@ -44,6 +44,8 @@ class AndroidVideoController extends PlatformVideoController {
   int? _pendingSurfaceSizeGeneration;
   int? _pendingSurfaceWidth;
   int? _pendingSurfaceHeight;
+  Completer<void> _currentMediaFirstFrameRendered = Completer<void>();
+  bool _hasLoadedMedia = false;
 
   // ----------------------------------------------
 
@@ -92,6 +94,11 @@ class AndroidVideoController extends PlatformVideoController {
         final current = path.toDartString();
         calloc.free(name.cast());
         mpv.mpv_free(path.cast());
+
+        if (vo == 'gpu' && _hasLoadedMedia) {
+          _currentMediaFirstFrameRendered = Completer<void>();
+        }
+        _hasLoadedMedia = true;
 
         if (_current != current) {
           _current = current;
@@ -373,6 +380,11 @@ class AndroidVideoController extends PlatformVideoController {
     });
   }
 
+  @override
+  Future<void> get waitUntilFirstFrameRendered => vo == 'gpu'
+      ? _currentMediaFirstFrameRendered.future
+      : super.waitUntilFirstFrameRendered;
+
   Future<void> _expectSurfaceTextureFrame(
     int width,
     int height, {
@@ -423,7 +435,19 @@ class AndroidVideoController extends PlatformVideoController {
     _pendingSurfaceSizeGeneration = null;
     _pendingSurfaceWidth = null;
     _pendingSurfaceHeight = null;
+    if (!_currentMediaFirstFrameRendered.isCompleted) {
+      _currentMediaFirstFrameRendered.complete();
+    }
     _publishSurfaceSize(width, height);
+  }
+
+  void _notifyFirstFrameRendered() {
+    if (!waitUntilFirstFrameRenderedCompleter.isCompleted) {
+      waitUntilFirstFrameRenderedCompleter.complete();
+    }
+    if (!_currentMediaFirstFrameRendered.isCompleted) {
+      _currentMediaFirstFrameRendered.complete();
+    }
   }
 
   void _invalidatePendingSurfaceSize() {
@@ -504,11 +528,7 @@ class AndroidVideoController extends PlatformVideoController {
                 final int handle = call.arguments['handle'];
                 debugPrint(handle.toString());
                 // Notify about the first frame being rendered.
-                final completer =
-                    _controllers[handle]?.waitUntilFirstFrameRenderedCompleter;
-                if (!(completer?.isCompleted ?? true)) {
-                  completer?.complete();
-                }
+                _controllers[handle]?._notifyFirstFrameRendered();
                 break;
               }
             case 'VideoOutput.SurfaceTextureFrameAvailable':
