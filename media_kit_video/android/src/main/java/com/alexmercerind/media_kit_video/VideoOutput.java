@@ -43,6 +43,10 @@ public class VideoOutput {
     private final Method newGlobalObjectRef;
     private final Method deleteGlobalObjectRef;
     private boolean waitUntilFirstFrameRenderedNotify;
+    private long pendingSurfaceTextureFrameGeneration;
+    private int pendingSurfaceTextureFrameWidth;
+    private int pendingSurfaceTextureFrameHeight;
+    private boolean skipSupersededSurfaceTextureFrame;
 
     private long handle;
     private MethodChannel channelReference;
@@ -83,49 +87,14 @@ public class VideoOutput {
         Log.i("media_kit", String.format(Locale.ENGLISH, "flutterJNIAPIAvailable = %b", flutterJNIAPIAvailable));
         if (flutterJNIAPIAvailable) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                surfaceTextureEntry.surfaceTexture().setOnFrameAvailableListener((texture) -> {
-                    synchronized (lock) {
-                        try {
-                            if (!waitUntilFirstFrameRenderedNotify) {
-                                waitUntilFirstFrameRenderedNotify = true;
-                                final HashMap<String, Object> data = new HashMap<>();
-                                data.put("handle", handle);
-                                channelReference.invokeMethod("VideoOutput.WaitUntilFirstFrameRenderedNotify", data);
-                                Log.i("media_kit", String.format(Locale.ENGLISH, "VideoOutput.WaitUntilFirstFrameRenderedNotify = %d", handle));
-                            }
-
-                            FlutterJNI flutterJNI = null;
-                            while (flutterJNI == null) {
-                                flutterJNI = getFlutterJNIReference();
-                                flutterJNI.markTextureFrameAvailable(id);
-                            }
-                        } catch (Throwable e) {
-                            e.printStackTrace();
-                        }
-                    }
-                }, new Handler());
+                surfaceTextureEntry.surfaceTexture().setOnFrameAvailableListener(
+                        (texture) -> onFrameAvailable(),
+                        new Handler(Looper.getMainLooper())
+                );
             } else {
-                surfaceTextureEntry.surfaceTexture().setOnFrameAvailableListener((texture) -> {
-                    synchronized (lock) {
-                        try {
-                            if (!waitUntilFirstFrameRenderedNotify) {
-                                waitUntilFirstFrameRenderedNotify = true;
-                                final HashMap<String, Object> data = new HashMap<>();
-                                data.put("handle", handle);
-                                channelReference.invokeMethod("VideoOutput.WaitUntilFirstFrameRenderedNotify", data);
-                                Log.i("media_kit", String.format(Locale.ENGLISH, "VideoOutput.WaitUntilFirstFrameRenderedNotify = %d", handle));
-                            }
-
-                            FlutterJNI flutterJNI = null;
-                            while (flutterJNI == null) {
-                                flutterJNI = getFlutterJNIReference();
-                                flutterJNI.markTextureFrameAvailable(id);
-                            }
-                        } catch (Throwable e) {
-                            e.printStackTrace();
-                        }
-                    }
-                });
+                surfaceTextureEntry.surfaceTexture().setOnFrameAvailableListener(
+                        (texture) -> onFrameAvailable()
+                );
             }
         } else {
             if (!waitUntilFirstFrameRenderedNotify) {
@@ -175,6 +144,8 @@ public class VideoOutput {
 
     public long createSurface() {
         synchronized (lock) {
+            pendingSurfaceTextureFrameGeneration = 0;
+            skipSupersededSurfaceTextureFrame = false;
             // Delete previous android.view.Surface & object reference.
             try {
                 if (surface != null) {
@@ -205,6 +176,60 @@ public class VideoOutput {
             surfaceTextureEntry.surfaceTexture().setDefaultBufferSize(width, height);
         } catch (Throwable e) {
             e.printStackTrace();
+        }
+    }
+
+    public void expectSurfaceTextureFrame(long generation, int width, int height) {
+        synchronized (lock) {
+            // A superseded resize can leave one buffer from the previous
+            // dimensions in flight. Do not acknowledge the new generation
+            // with that buffer.
+            skipSupersededSurfaceTextureFrame =
+                    pendingSurfaceTextureFrameGeneration != 0;
+            pendingSurfaceTextureFrameGeneration = generation;
+            pendingSurfaceTextureFrameWidth = width;
+            pendingSurfaceTextureFrameHeight = height;
+        }
+    }
+
+    private void onFrameAvailable() {
+        synchronized (lock) {
+            try {
+                if (!waitUntilFirstFrameRenderedNotify) {
+                    waitUntilFirstFrameRenderedNotify = true;
+                    final HashMap<String, Object> data = new HashMap<>();
+                    data.put("handle", handle);
+                    channelReference.invokeMethod("VideoOutput.WaitUntilFirstFrameRenderedNotify", data);
+                    Log.i("media_kit", String.format(Locale.ENGLISH, "VideoOutput.WaitUntilFirstFrameRenderedNotify = %d", handle));
+                }
+
+                final FlutterJNI flutterJNI = getFlutterJNIReference();
+                if (flutterJNI != null) {
+                    flutterJNI.markTextureFrameAvailable(id);
+                }
+
+                if (pendingSurfaceTextureFrameGeneration != 0) {
+                    if (skipSupersededSurfaceTextureFrame) {
+                        skipSupersededSurfaceTextureFrame = false;
+                        return;
+                    }
+
+                    final long generation = pendingSurfaceTextureFrameGeneration;
+                    pendingSurfaceTextureFrameGeneration = 0;
+
+                    final HashMap<String, Object> data = new HashMap<>();
+                    data.put("handle", handle);
+                    data.put("generation", generation);
+                    data.put("width", pendingSurfaceTextureFrameWidth);
+                    data.put("height", pendingSurfaceTextureFrameHeight);
+                    channelReference.invokeMethod(
+                            "VideoOutput.SurfaceTextureFrameAvailable",
+                            data
+                    );
+                }
+            } catch (Throwable e) {
+                e.printStackTrace();
+            }
         }
     }
 
