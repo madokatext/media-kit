@@ -44,7 +44,11 @@ abstract class PlatformVideoController {
   /// Remember:
   /// * “Premature optimization is the root of all evil”
   /// * “With great power comes great responsibility”
-  Future<void>? setSize({int? width, int? height});
+  Future<void>? setSize({
+    int? width,
+    int? height,
+    bool waitForFrame = false,
+  });
 
   /// A [Future] that completes when the first video frame has been rendered.
   Future<void> get waitUntilFirstFrameRendered =>
