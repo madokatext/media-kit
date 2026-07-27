@@ -35,6 +35,9 @@ class AndroidVideoController extends PlatformVideoController {
   /// Fixed height of the video output.
   int? height;
 
+  int? _sourceWidth;
+  int? _sourceHeight;
+
   // ----------------------------------------------
 
   bool get androidAttachSurfaceAfterVideoParameters =>
@@ -68,6 +71,9 @@ class AndroidVideoController extends PlatformVideoController {
 
   /// {@macro android_video_controller}
   AndroidVideoController._(super.player, super.configuration) {
+    width = configuration.width;
+    height = configuration.height;
+
     player.onLoadHooks.add(() {
       return _lock.synchronized(() async {
         final mpv = NativePlayer.mpv;
@@ -144,15 +150,16 @@ class AndroidVideoController extends PlatformVideoController {
         final int width;
         final int height;
         if (event.rotate == 0 || event.rotate == 180) {
-          width = event.dw ?? 0;
-          height = event.dh ?? 0;
+          _sourceWidth = event.dw ?? 0;
+          _sourceHeight = event.dh ?? 0;
         } else {
           // width & height are swapped for 90 or 270 degrees rotation.
-          width = event.dh ?? 0;
-          height = event.dw ?? 0;
+          _sourceWidth = event.dh ?? 0;
+          _sourceHeight = event.dw ?? 0;
         }
 
-        rect.value = Rect.zero;
+        width = vo == 'gpu' ? _outputWidth! : _sourceWidth!;
+        height = vo == 'gpu' ? _outputHeight! : _sourceHeight!;
         try {
           if (vo == 'gpu') {
             // NOTE: Only required for --vo=gpu
@@ -175,12 +182,14 @@ class AndroidVideoController extends PlatformVideoController {
           debugPrint(exception.toString());
           debugPrint(stacktrace.toString());
         }
-        rect.value = Rect.fromLTRB(
-          0.0,
-          0.0,
-          width.toDouble(),
-          height.toDouble(),
-        );
+        if (vo != 'gpu') {
+          rect.value = Rect.fromLTRB(
+            0.0,
+            0.0,
+            width.toDouble(),
+            height.toDouble(),
+          );
+        }
       }),
     );
   }
@@ -253,9 +262,67 @@ class AndroidVideoController extends PlatformVideoController {
   /// * “Premature optimization is the root of all evil”
   /// * “With great power comes great responsibility”
   @override
-  Future<void>? setSize({int? width, int? height}) {
-    throw UnsupportedError(
-      '[AndroidVideoController.setSize] is not available on Android',
+  Future<void> setSize({int? width, int? height}) async {
+    if ((width != null && width <= 0) || (height != null && height <= 0)) {
+      throw ArgumentError('width & height must be null or positive.');
+    }
+
+    await _lock.synchronized(() async {
+      this.width = width;
+      this.height = height;
+
+      final outputWidth = _outputWidth;
+      final outputHeight = _outputHeight;
+      if (_wid == null ||
+          vo != 'gpu' ||
+          outputWidth == null ||
+          outputHeight == null) {
+        return;
+      }
+
+      await _channel.invokeMethod<void>(
+        'VideoOutputManager.SetSurfaceTextureSize',
+        {
+          'handle': player.handle.toString(),
+          'width': outputWidth.toString(),
+          'height': outputHeight.toString(),
+        },
+      );
+      player.setProperty(
+        'android-surface-size',
+        '${outputWidth}x$outputHeight',
+      );
+    });
+  }
+
+  int? get _outputWidth {
+    if (width != null) return width;
+    if (height != null && _sourceWidth != null && _sourceHeight != null) {
+      return (height! * _sourceWidth! / _sourceHeight!).round();
+    }
+    return _sourceWidth;
+  }
+
+  int? get _outputHeight {
+    if (height != null) return height;
+    if (width != null && _sourceWidth != null && _sourceHeight != null) {
+      return (width! * _sourceHeight! / _sourceWidth!).round();
+    }
+    return _sourceHeight;
+  }
+
+  void _notifySurfaceTextureSize(int width, int height) {
+    final expectedWidth = _outputWidth;
+    final expectedHeight = _outputHeight;
+    if (width != expectedWidth || height != expectedHeight) {
+      return;
+    }
+
+    rect.value = Rect.fromLTRB(
+      0.0,
+      0.0,
+      width.toDouble(),
+      height.toDouble(),
     );
   }
 
@@ -303,6 +370,14 @@ class AndroidVideoController extends PlatformVideoController {
                 if (!(completer?.isCompleted ?? true)) {
                   completer?.complete();
                 }
+                break;
+              }
+            case 'VideoOutput.SurfaceTextureSizeChanged':
+              {
+                final int handle = call.arguments['handle'];
+                final int width = call.arguments['width'];
+                final int height = call.arguments['height'];
+                _controllers[handle]?._notifySurfaceTextureSize(width, height);
                 break;
               }
             default:
