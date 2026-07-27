@@ -125,7 +125,11 @@ class NativeVideoController extends PlatformVideoController {
   /// * “Premature optimization is the root of all evil”
   /// * “With great power comes great responsibility”
   @override
-  Future<void>? setSize({int? width, int? height}) {
+  Future<void>? setSize({
+    int? width,
+    int? height,
+    bool waitForFrame = false,
+  }) {
     if (this.width == width && this.height == height) {
       // No need to resize if the requested size is same as the current size.
       return null;
