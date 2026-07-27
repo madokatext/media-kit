@@ -37,6 +37,9 @@ class AndroidVideoController extends PlatformVideoController {
 
   int? _sourceWidth;
   int? _sourceHeight;
+  int? _surfaceWidth;
+  int? _surfaceHeight;
+  bool _surfaceAttached = false;
 
   // ----------------------------------------------
 
@@ -88,6 +91,9 @@ class AndroidVideoController extends PlatformVideoController {
 
         if (_current != current) {
           _current = current;
+          _surfaceAttached = false;
+          _surfaceWidth = null;
+          _surfaceHeight = null;
           // It is important to use a new android.view.Surface each time a new video-output is created because: https://stackoverflow.com/a/21564236
           // Not doing so will cause MediaCodec usage inside libavcodec to incorrectly fail with error (because this android.view.Surface would be used twice):
           // "native_window_api_connect returned an error: Invalid argument (-22)" & next less-efficient hwdec will be used redundantly.
@@ -112,6 +118,7 @@ class AndroidVideoController extends PlatformVideoController {
           if (!androidAttachSurfaceAfterVideoParameters) {
             player.setOption('wid', _wid.toString());
             player.setOption('vo', vo);
+            _surfaceAttached = vo == 'gpu';
           }
           // ----------------------------------------------
         } catch (exception, stacktrace) {
@@ -122,6 +129,9 @@ class AndroidVideoController extends PlatformVideoController {
     });
     player.onUnloadHooks.add(() {
       return _lock.synchronizedSync(() {
+        _surfaceAttached = false;
+        _surfaceWidth = null;
+        _surfaceHeight = null;
         // Release any references to current android.view.Surface.
         //
         // It is important to set --vo=null here for 2 reasons:
@@ -162,34 +172,36 @@ class AndroidVideoController extends PlatformVideoController {
         height = vo == 'gpu' ? _outputHeight! : _sourceHeight!;
         try {
           if (vo == 'gpu') {
-            // NOTE: Only required for --vo=gpu
-            // With --vo=gpu, we need to update the android.graphics.SurfaceTexture size & notify libmpv to re-create vo.
-            // In native Android, this kind of rendering is done with android.view.SurfaceView + android.view.SurfaceHolder, which offers onSurfaceChanged to handle this.
-            await _channel
-                .invokeMethod('VideoOutputManager.SetSurfaceTextureSize', {
+            if (_surfaceWidth != width || _surfaceHeight != height) {
+              await _channel.invokeMethod(
+                'VideoOutputManager.SetSurfaceTextureSize',
+                {
                   'handle': player.handle.toString(),
                   'width': width.toString(),
                   'height': height.toString(),
-                });
+                },
+              );
+              player.setOption('android-surface-size', '${width}x$height');
+              _surfaceWidth = width;
+              _surfaceHeight = height;
+            }
 
-            // ----------------------------------------------
-            player.setOption('android-surface-size', '${width}x$height');
-            player.setOption('wid', _wid.toString());
-            player.setOption('vo', 'gpu');
+            if (!_surfaceAttached) {
+              player.setOption('wid', _wid.toString());
+              player.setOption('vo', 'gpu');
+              _surfaceAttached = true;
+            }
           }
-          // ----------------------------------------------
         } catch (exception, stacktrace) {
           debugPrint(exception.toString());
           debugPrint(stacktrace.toString());
         }
-        if (vo != 'gpu') {
-          rect.value = Rect.fromLTRB(
-            0.0,
-            0.0,
-            width.toDouble(),
-            height.toDouble(),
-          );
-        }
+        rect.value = Rect.fromLTRB(
+          0.0,
+          0.0,
+          width.toDouble(),
+          height.toDouble(),
+        );
       }),
     );
   }
@@ -275,22 +287,33 @@ class AndroidVideoController extends PlatformVideoController {
       final outputHeight = _outputHeight;
       if (_wid == null ||
           vo != 'gpu' ||
+          !_surfaceAttached ||
           outputWidth == null ||
           outputHeight == null) {
         return;
       }
 
-      await _channel.invokeMethod<void>(
-        'VideoOutputManager.SetSurfaceTextureSize',
-        {
-          'handle': player.handle.toString(),
-          'width': outputWidth.toString(),
-          'height': outputHeight.toString(),
-        },
-      );
-      player.setProperty(
-        'android-surface-size',
-        '${outputWidth}x$outputHeight',
+      if (_surfaceWidth != outputWidth || _surfaceHeight != outputHeight) {
+        await _channel.invokeMethod<void>(
+          'VideoOutputManager.SetSurfaceTextureSize',
+          {
+            'handle': player.handle.toString(),
+            'width': outputWidth.toString(),
+            'height': outputHeight.toString(),
+          },
+        );
+        player.setProperty(
+          'android-surface-size',
+          '${outputWidth}x$outputHeight',
+        );
+        _surfaceWidth = outputWidth;
+        _surfaceHeight = outputHeight;
+      }
+      rect.value = Rect.fromLTRB(
+        0.0,
+        0.0,
+        outputWidth.toDouble(),
+        outputHeight.toDouble(),
       );
     });
   }
@@ -309,21 +332,6 @@ class AndroidVideoController extends PlatformVideoController {
       return (width! * _sourceHeight! / _sourceWidth!).round();
     }
     return _sourceHeight;
-  }
-
-  void _notifySurfaceTextureSize(int width, int height) {
-    final expectedWidth = _outputWidth;
-    final expectedHeight = _outputHeight;
-    if (width != expectedWidth || height != expectedHeight) {
-      return;
-    }
-
-    rect.value = Rect.fromLTRB(
-      0.0,
-      0.0,
-      width.toDouble(),
-      height.toDouble(),
-    );
   }
 
   /// Disposes the instance. Releases allocated resources back to the system.
@@ -370,14 +378,6 @@ class AndroidVideoController extends PlatformVideoController {
                 if (!(completer?.isCompleted ?? true)) {
                   completer?.complete();
                 }
-                break;
-              }
-            case 'VideoOutput.SurfaceTextureSizeChanged':
-              {
-                final int handle = call.arguments['handle'];
-                final int width = call.arguments['width'];
-                final int height = call.arguments['height'];
-                _controllers[handle]?._notifySurfaceTextureSize(width, height);
                 break;
               }
             default:
