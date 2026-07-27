@@ -448,9 +448,6 @@ class AndroidVideoController extends PlatformVideoController {
     if (!waitUntilFirstFrameRenderedCompleter.isCompleted) {
       waitUntilFirstFrameRenderedCompleter.complete();
     }
-    if (!_currentMediaFirstFrameRendered.isCompleted) {
-      _currentMediaFirstFrameRendered.complete();
-    }
   }
 
   void _invalidatePendingSurfaceSize() {
