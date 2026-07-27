@@ -195,23 +195,37 @@ class AndroidVideoController extends PlatformVideoController {
               }
               _surfaceWidth = width;
               _surfaceHeight = height;
-
-              if (surfaceWasAttached) {
-                await _expectSurfaceTextureFrame(width, height);
-              }
             }
 
             if (!_surfaceAttached) {
+              // Arm the notification before attaching the surface so the
+              // first real video frame cannot arrive between attachment and
+              // registration.
+              await _expectSurfaceTextureFrame(
+                width,
+                height,
+                minimumFrameCount: 1,
+              );
               player.setOption('wid', _wid.toString());
               player.setOption('vo', 'gpu');
               _surfaceAttached = true;
+            } else if (!_rectMatches(width, height) &&
+                (_pendingSurfaceWidth != width ||
+                    _pendingSurfaceHeight != height)) {
+              // Media reconfiguration only needs the first frame produced
+              // for the new video parameters.
+              await _expectSurfaceTextureFrame(
+                width,
+                height,
+                minimumFrameCount: 1,
+              );
             }
           }
         } catch (exception, stacktrace) {
           debugPrint(exception.toString());
           debugPrint(stacktrace.toString());
         }
-        if (vo != 'gpu' || !surfaceWasAttached) {
+        if (vo != 'gpu') {
           _publishSurfaceSize(width, height);
         }
       }),
@@ -286,7 +300,11 @@ class AndroidVideoController extends PlatformVideoController {
   /// * “Premature optimization is the root of all evil”
   /// * “With great power comes great responsibility”
   @override
-  Future<void> setSize({int? width, int? height}) async {
+  Future<void> setSize({
+    int? width,
+    int? height,
+    bool waitForFrame = false,
+  }) async {
     if ((width != null && width <= 0) || (height != null && height <= 0)) {
       throw ArgumentError('width & height must be null or positive.');
     }
@@ -294,6 +312,18 @@ class AndroidVideoController extends PlatformVideoController {
     await _lock.synchronized(() async {
       this.width = width;
       this.height = height;
+
+      if (!waitForFrame &&
+          _pendingSurfaceSizeGeneration != null) {
+        // Ordinary layout changes must remain responsive. Invalidate the
+        // Dart generation before crossing the platform channel so an
+        // already queued acknowledgement cannot publish an obsolete size.
+        _invalidatePendingSurfaceSize();
+        await _channel.invokeMethod<void>(
+          'VideoOutputManager.CancelSurfaceTextureFrameExpectation',
+          {'handle': player.handle.toString()},
+        );
+      }
 
       final outputWidth = _outputWidth;
       final outputHeight = _outputHeight;
@@ -322,17 +352,32 @@ class AndroidVideoController extends PlatformVideoController {
         _surfaceHeight = outputHeight;
       }
 
-      if (!_rectMatches(outputWidth, outputHeight) &&
-          (_pendingSurfaceWidth != outputWidth ||
-              _pendingSurfaceHeight != outputHeight)) {
-        // Keep [rect] at the last frame-backed size until Android reports a
-        // frame queued after this resize request.
-        await _expectSurfaceTextureFrame(outputWidth, outputHeight);
+      if (waitForFrame) {
+        if (!_rectMatches(outputWidth, outputHeight) &&
+            (_pendingSurfaceWidth != outputWidth ||
+                _pendingSurfaceHeight != outputHeight)) {
+          // A SurfaceTexture callback can still belong to one buffer queued
+          // before the resize command. Fullscreen transitions therefore
+          // require two callbacks before publishing the target size.
+          await _expectSurfaceTextureFrame(
+            outputWidth,
+            outputHeight,
+            minimumFrameCount: 2,
+          );
+        }
+      } else {
+        // Preserve the original immediate resize behavior for continuously
+        // changing layouts such as comment-panel drags and pinch gestures.
+        _publishSurfaceSize(outputWidth, outputHeight);
       }
     });
   }
 
-  Future<void> _expectSurfaceTextureFrame(int width, int height) async {
+  Future<void> _expectSurfaceTextureFrame(
+    int width,
+    int height, {
+    required int minimumFrameCount,
+  }) async {
     final generation = ++_surfaceSizeGeneration;
     _pendingSurfaceSizeGeneration = generation;
     _pendingSurfaceWidth = width;
@@ -346,6 +391,7 @@ class AndroidVideoController extends PlatformVideoController {
           'generation': generation.toString(),
           'width': width.toString(),
           'height': height.toString(),
+          'minimumFrameCount': minimumFrameCount.toString(),
         },
       );
     } catch (_) {
@@ -353,6 +399,9 @@ class AndroidVideoController extends PlatformVideoController {
         _pendingSurfaceSizeGeneration = null;
         _pendingSurfaceWidth = null;
         _pendingSurfaceHeight = null;
+      }
+      if (_surfaceWidth == width && _surfaceHeight == height) {
+        _publishSurfaceSize(width, height);
       }
       rethrow;
     }
