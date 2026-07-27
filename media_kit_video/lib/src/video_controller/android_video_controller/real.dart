@@ -40,6 +40,10 @@ class AndroidVideoController extends PlatformVideoController {
   int? _surfaceWidth;
   int? _surfaceHeight;
   bool _surfaceAttached = false;
+  int _surfaceSizeGeneration = 0;
+  int? _pendingSurfaceSizeGeneration;
+  int? _pendingSurfaceWidth;
+  int? _pendingSurfaceHeight;
 
   // ----------------------------------------------
 
@@ -94,6 +98,7 @@ class AndroidVideoController extends PlatformVideoController {
           _surfaceAttached = false;
           _surfaceWidth = null;
           _surfaceHeight = null;
+          _invalidatePendingSurfaceSize();
           // It is important to use a new android.view.Surface each time a new video-output is created because: https://stackoverflow.com/a/21564236
           // Not doing so will cause MediaCodec usage inside libavcodec to incorrectly fail with error (because this android.view.Surface would be used twice):
           // "native_window_api_connect returned an error: Invalid argument (-22)" & next less-efficient hwdec will be used redundantly.
@@ -132,6 +137,7 @@ class AndroidVideoController extends PlatformVideoController {
         _surfaceAttached = false;
         _surfaceWidth = null;
         _surfaceHeight = null;
+        _invalidatePendingSurfaceSize();
         // Release any references to current android.view.Surface.
         //
         // It is important to set --vo=null here for 2 reasons:
@@ -170,6 +176,7 @@ class AndroidVideoController extends PlatformVideoController {
 
         width = vo == 'gpu' ? _outputWidth! : _sourceWidth!;
         height = vo == 'gpu' ? _outputHeight! : _sourceHeight!;
+        final surfaceWasAttached = _surfaceAttached;
         try {
           if (vo == 'gpu') {
             if (_surfaceWidth != width || _surfaceHeight != height) {
@@ -181,9 +188,17 @@ class AndroidVideoController extends PlatformVideoController {
                   'height': height.toString(),
                 },
               );
-              player.setOption('android-surface-size', '${width}x$height');
+              if (surfaceWasAttached) {
+                player.setProperty('android-surface-size', '${width}x$height');
+              } else {
+                player.setOption('android-surface-size', '${width}x$height');
+              }
               _surfaceWidth = width;
               _surfaceHeight = height;
+
+              if (surfaceWasAttached) {
+                await _expectSurfaceTextureFrame(width, height);
+              }
             }
 
             if (!_surfaceAttached) {
@@ -196,12 +211,9 @@ class AndroidVideoController extends PlatformVideoController {
           debugPrint(exception.toString());
           debugPrint(stacktrace.toString());
         }
-        rect.value = Rect.fromLTRB(
-          0.0,
-          0.0,
-          width.toDouble(),
-          height.toDouble(),
-        );
+        if (vo != 'gpu' || !surfaceWasAttached) {
+          _publishSurfaceSize(width, height);
+        }
       }),
     );
   }
@@ -309,13 +321,83 @@ class AndroidVideoController extends PlatformVideoController {
         _surfaceWidth = outputWidth;
         _surfaceHeight = outputHeight;
       }
-      rect.value = Rect.fromLTRB(
-        0.0,
-        0.0,
-        outputWidth.toDouble(),
-        outputHeight.toDouble(),
-      );
+
+      if (!_rectMatches(outputWidth, outputHeight) &&
+          (_pendingSurfaceWidth != outputWidth ||
+              _pendingSurfaceHeight != outputHeight)) {
+        // Keep [rect] at the last frame-backed size until Android reports a
+        // frame queued after this resize request.
+        await _expectSurfaceTextureFrame(outputWidth, outputHeight);
+      }
     });
+  }
+
+  Future<void> _expectSurfaceTextureFrame(int width, int height) async {
+    final generation = ++_surfaceSizeGeneration;
+    _pendingSurfaceSizeGeneration = generation;
+    _pendingSurfaceWidth = width;
+    _pendingSurfaceHeight = height;
+
+    try {
+      await _channel.invokeMethod<void>(
+        'VideoOutputManager.ExpectSurfaceTextureFrame',
+        {
+          'handle': player.handle.toString(),
+          'generation': generation.toString(),
+          'width': width.toString(),
+          'height': height.toString(),
+        },
+      );
+    } catch (_) {
+      if (_pendingSurfaceSizeGeneration == generation) {
+        _pendingSurfaceSizeGeneration = null;
+        _pendingSurfaceWidth = null;
+        _pendingSurfaceHeight = null;
+      }
+      rethrow;
+    }
+  }
+
+  void _notifySurfaceTextureFrame(
+    int generation,
+    int width,
+    int height,
+  ) {
+    if (_pendingSurfaceSizeGeneration != generation ||
+        _pendingSurfaceWidth != width ||
+        _pendingSurfaceHeight != height ||
+        _surfaceWidth != width ||
+        _surfaceHeight != height) {
+      return;
+    }
+
+    _pendingSurfaceSizeGeneration = null;
+    _pendingSurfaceWidth = null;
+    _pendingSurfaceHeight = null;
+    _publishSurfaceSize(width, height);
+  }
+
+  void _invalidatePendingSurfaceSize() {
+    _surfaceSizeGeneration++;
+    _pendingSurfaceSizeGeneration = null;
+    _pendingSurfaceWidth = null;
+    _pendingSurfaceHeight = null;
+  }
+
+  bool _rectMatches(int width, int height) {
+    final current = rect.value;
+    return current != null &&
+        current.width == width &&
+        current.height == height;
+  }
+
+  void _publishSurfaceSize(int width, int height) {
+    rect.value = Rect.fromLTRB(
+      0.0,
+      0.0,
+      width.toDouble(),
+      height.toDouble(),
+    );
   }
 
   int? get _outputWidth {
@@ -378,6 +460,19 @@ class AndroidVideoController extends PlatformVideoController {
                 if (!(completer?.isCompleted ?? true)) {
                   completer?.complete();
                 }
+                break;
+              }
+            case 'VideoOutput.SurfaceTextureFrameAvailable':
+              {
+                final int handle = call.arguments['handle'];
+                final int generation = call.arguments['generation'];
+                final int width = call.arguments['width'];
+                final int height = call.arguments['height'];
+                _controllers[handle]?._notifySurfaceTextureFrame(
+                  generation,
+                  width,
+                  height,
+                );
                 break;
               }
             default:
