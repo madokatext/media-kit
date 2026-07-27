@@ -140,12 +140,28 @@ public class MediaKitVideoPlugin implements FlutterPlugin, MethodCallHandler, Ac
                     final String generation = call.argument("generation");
                     final String width = call.argument("width");
                     final String height = call.argument("height");
-                    if (handle != null && generation != null && width != null && height != null) {
+                    final String minimumFrameCount = call.argument("minimumFrameCount");
+                    if (handle != null &&
+                            generation != null &&
+                            width != null &&
+                            height != null &&
+                            minimumFrameCount != null) {
                         videoOutputManager.expectSurfaceTextureFrame(
                                 Long.parseLong(handle),
                                 Long.parseLong(generation),
                                 Integer.parseInt(width),
-                                Integer.parseInt(height)
+                                Integer.parseInt(height),
+                                Integer.parseInt(minimumFrameCount)
+                        );
+                    }
+                    result.success(null);
+                    break;
+                }
+                case "VideoOutputManager.CancelSurfaceTextureFrameExpectation": {
+                    final String handle = call.argument("handle");
+                    if (handle != null) {
+                        videoOutputManager.cancelSurfaceTextureFrameExpectation(
+                                Long.parseLong(handle)
                         );
                     }
                     result.success(null);
