@@ -46,7 +46,7 @@ public class VideoOutput {
     private long pendingSurfaceTextureFrameGeneration;
     private int pendingSurfaceTextureFrameWidth;
     private int pendingSurfaceTextureFrameHeight;
-    private boolean skipSupersededSurfaceTextureFrame;
+    private int pendingSurfaceTextureFrames;
 
     private long handle;
     private MethodChannel channelReference;
@@ -145,7 +145,7 @@ public class VideoOutput {
     public long createSurface() {
         synchronized (lock) {
             pendingSurfaceTextureFrameGeneration = 0;
-            skipSupersededSurfaceTextureFrame = false;
+            pendingSurfaceTextureFrames = 0;
             // Delete previous android.view.Surface & object reference.
             try {
                 if (surface != null) {
@@ -179,16 +179,27 @@ public class VideoOutput {
         }
     }
 
-    public void expectSurfaceTextureFrame(long generation, int width, int height) {
+    public void expectSurfaceTextureFrame(
+            long generation,
+            int width,
+            int height,
+            int minimumFrameCount
+    ) {
         synchronized (lock) {
-            // A superseded resize can leave one buffer from the previous
-            // dimensions in flight. Do not acknowledge the new generation
-            // with that buffer.
-            skipSupersededSurfaceTextureFrame =
-                    pendingSurfaceTextureFrameGeneration != 0;
             pendingSurfaceTextureFrameGeneration = generation;
             pendingSurfaceTextureFrameWidth = width;
             pendingSurfaceTextureFrameHeight = height;
+            pendingSurfaceTextureFrames = Math.max(1, minimumFrameCount);
+            if (!flutterJNIAPIAvailable) {
+                notifySurfaceTextureFrameAvailable();
+            }
+        }
+    }
+
+    public void cancelSurfaceTextureFrameExpectation() {
+        synchronized (lock) {
+            pendingSurfaceTextureFrameGeneration = 0;
+            pendingSurfaceTextureFrames = 0;
         }
     }
 
@@ -208,29 +219,33 @@ public class VideoOutput {
                     flutterJNI.markTextureFrameAvailable(id);
                 }
 
-                if (pendingSurfaceTextureFrameGeneration != 0) {
-                    if (skipSupersededSurfaceTextureFrame) {
-                        skipSupersededSurfaceTextureFrame = false;
-                        return;
-                    }
-
-                    final long generation = pendingSurfaceTextureFrameGeneration;
-                    pendingSurfaceTextureFrameGeneration = 0;
-
-                    final HashMap<String, Object> data = new HashMap<>();
-                    data.put("handle", handle);
-                    data.put("generation", generation);
-                    data.put("width", pendingSurfaceTextureFrameWidth);
-                    data.put("height", pendingSurfaceTextureFrameHeight);
-                    channelReference.invokeMethod(
-                            "VideoOutput.SurfaceTextureFrameAvailable",
-                            data
-                    );
+                if (pendingSurfaceTextureFrameGeneration != 0 &&
+                        --pendingSurfaceTextureFrames <= 0) {
+                    notifySurfaceTextureFrameAvailable();
                 }
             } catch (Throwable e) {
                 e.printStackTrace();
             }
         }
+    }
+
+    private void notifySurfaceTextureFrameAvailable() {
+        final long generation = pendingSurfaceTextureFrameGeneration;
+        if (generation == 0) {
+            return;
+        }
+        pendingSurfaceTextureFrameGeneration = 0;
+        pendingSurfaceTextureFrames = 0;
+
+        final HashMap<String, Object> data = new HashMap<>();
+        data.put("handle", handle);
+        data.put("generation", generation);
+        data.put("width", pendingSurfaceTextureFrameWidth);
+        data.put("height", pendingSurfaceTextureFrameHeight);
+        channelReference.invokeMethod(
+                "VideoOutput.SurfaceTextureFrameAvailable",
+                data
+        );
     }
 
     private void clearSurface() {
