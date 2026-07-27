@@ -45,7 +45,6 @@ class AndroidVideoController extends PlatformVideoController {
   int? _pendingSurfaceWidth;
   int? _pendingSurfaceHeight;
   Completer<void> _currentMediaFirstFrameRendered = Completer<void>();
-  bool _hasLoadedMedia = false;
 
   // ----------------------------------------------
 
@@ -94,11 +93,6 @@ class AndroidVideoController extends PlatformVideoController {
         final current = path.toDartString();
         calloc.free(name.cast());
         mpv.mpv_free(path.cast());
-
-        if (vo == 'gpu' && _hasLoadedMedia) {
-          _currentMediaFirstFrameRendered = Completer<void>();
-        }
-        _hasLoadedMedia = true;
 
         if (_current != current) {
           _current = current;
@@ -384,6 +378,15 @@ class AndroidVideoController extends PlatformVideoController {
   Future<void> get waitUntilFirstFrameRendered => vo == 'gpu'
       ? _currentMediaFirstFrameRendered.future
       : super.waitUntilFirstFrameRendered;
+
+  @override
+  Future<void> armWaitUntilFirstFrameRendered() {
+    if (vo != 'gpu') {
+      return super.armWaitUntilFirstFrameRendered();
+    }
+    _currentMediaFirstFrameRendered = Completer<void>();
+    return _currentMediaFirstFrameRendered.future;
+  }
 
   Future<void> _expectSurfaceTextureFrame(
     int width,

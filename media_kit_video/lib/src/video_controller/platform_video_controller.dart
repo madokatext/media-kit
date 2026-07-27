@@ -54,6 +54,11 @@ abstract class PlatformVideoController {
   Future<void> get waitUntilFirstFrameRendered =>
       waitUntilFirstFrameRenderedCompleter.future;
 
+  /// Arms and returns the first-frame notification for the media that is
+  /// about to be opened.
+  Future<void> armWaitUntilFirstFrameRendered() =>
+      waitUntilFirstFrameRendered;
+
   /// [Completer] used to signal the decoding & rendering of the first video frame.
   /// Use [waitUntilFirstFrameRendered] to wait for the first frame to be rendered.
   @protected
