@@ -43,9 +43,6 @@ public class VideoOutput {
     private final Method newGlobalObjectRef;
     private final Method deleteGlobalObjectRef;
     private boolean waitUntilFirstFrameRenderedNotify;
-    private int pendingSurfaceTextureWidth;
-    private int pendingSurfaceTextureHeight;
-    private int pendingSurfaceTextureFrames;
 
     private long handle;
     private MethodChannel channelReference;
@@ -102,7 +99,6 @@ public class VideoOutput {
                                 flutterJNI = getFlutterJNIReference();
                                 flutterJNI.markTextureFrameAvailable(id);
                             }
-                            notifySurfaceTextureSizeIfReady();
                         } catch (Throwable e) {
                             e.printStackTrace();
                         }
@@ -125,7 +121,6 @@ public class VideoOutput {
                                 flutterJNI = getFlutterJNIReference();
                                 flutterJNI.markTextureFrameAvailable(id);
                             }
-                            notifySurfaceTextureSizeIfReady();
                         } catch (Throwable e) {
                             e.printStackTrace();
                         }
@@ -180,7 +175,6 @@ public class VideoOutput {
 
     public long createSurface() {
         synchronized (lock) {
-            pendingSurfaceTextureFrames = 0;
             // Delete previous android.view.Surface & object reference.
             try {
                 if (surface != null) {
@@ -207,36 +201,10 @@ public class VideoOutput {
     }
 
     public void setSurfaceTextureSize(int width, int height) {
-        synchronized (lock) {
-            try {
-                pendingSurfaceTextureWidth = width;
-                pendingSurfaceTextureHeight = height;
-                // The first callback may still belong to a buffer queued before
-                // setDefaultBufferSize. Publish after two frame callbacks.
-                pendingSurfaceTextureFrames = 2;
-                surfaceTextureEntry.surfaceTexture().setDefaultBufferSize(width, height);
-                if (!flutterJNIAPIAvailable) {
-                    pendingSurfaceTextureFrames = 1;
-                    notifySurfaceTextureSizeIfReady();
-                }
-            } catch (Throwable e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
-    private void notifySurfaceTextureSizeIfReady() {
-        if (pendingSurfaceTextureFrames <= 0) {
-            return;
-        }
-
-        pendingSurfaceTextureFrames--;
-        if (pendingSurfaceTextureFrames == 0) {
-            final HashMap<String, Object> data = new HashMap<>();
-            data.put("handle", handle);
-            data.put("width", pendingSurfaceTextureWidth);
-            data.put("height", pendingSurfaceTextureHeight);
-            channelReference.invokeMethod("VideoOutput.SurfaceTextureSizeChanged", data);
+        try {
+            surfaceTextureEntry.surfaceTexture().setDefaultBufferSize(width, height);
+        } catch (Throwable e) {
+            e.printStackTrace();
         }
     }
 
