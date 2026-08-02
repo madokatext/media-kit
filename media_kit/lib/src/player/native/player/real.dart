@@ -942,6 +942,24 @@ class NativePlayer extends PlatformPlayer {
   }
 
   Future<void> _handler(Pointer<generated.mpv_event> event) async {
+    try {
+      await _handleEvent(event);
+    } catch (exception, stacktrace) {
+      final log = PlayerLog(
+        prefix: 'media_kit',
+        level: 'error',
+        text: 'Native event callback exception: $exception\n$stacktrace',
+      );
+      if (!logController.isClosed) {
+        logController.add(log);
+      } else {
+        print(exception);
+        print(stacktrace);
+      }
+    }
+  }
+
+  Future<void> _handleEvent(Pointer<generated.mpv_event> event) async {
     final eventId = event.ref.event_id;
     switch (eventId) {
       case generated.mpv_event_id.MPV_EVENT_PROPERTY_CHANGE:
