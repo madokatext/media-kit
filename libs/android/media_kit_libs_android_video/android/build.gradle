@@ -56,35 +56,50 @@ task downloadDependencies(type: Exec) {
         }
         outputDir.mkdirs()
 
-        // Download all *.jar dependencies & verify their MD5 checksums.
+        // Pin immutable GitHub release asset IDs and verify their SHA-256 digests.
         def filesToDownload = [
-            ["url": "https://github.com/bggRGjQaUbCoE/libmpv-android-video-build/releases/download/vnext/default-arm64-v8a.jar", "md5": "2451ce9f388c67cf19e26e1f8f4caf0c", "destination": file("$buildDir/v1.1.6/default-arm64-v8a.jar")],
-            ["url": "https://github.com/bggRGjQaUbCoE/libmpv-android-video-build/releases/download/vnext/default-armeabi-v7a.jar", "md5": "9d6caaa4d6bf660f4d9a611c4deab5af", "destination": file("$buildDir/v1.1.6/default-armeabi-v7a.jar")],
-            ["url": "https://github.com/bggRGjQaUbCoE/libmpv-android-video-build/releases/download/vnext/default-x86_64.jar", "md5": "e54e49b7c87d2367c515d7c24c934fbb", "destination": file("$buildDir/v1.1.6/default-x86_64.jar")],
+            ["url": "https://api.github.com/repos/bggRGjQaUbCoE/libmpv-android-video-build/releases/assets/512692511", "sha256": "2c67bc2ebd4d831a6dddf683aee8e7e3da8088a188b3f0185e0a758c8caeff1e", "destination": file("$buildDir/vnext-0bb7758/default-arm64-v8a.jar")],
+            ["url": "https://api.github.com/repos/bggRGjQaUbCoE/libmpv-android-video-build/releases/assets/512692515", "sha256": "2ba89da4fb3f208ea6228f0499e7cb7b535bb73b59f6dd86a0ab32498fe42984", "destination": file("$buildDir/vnext-0bb7758/default-armeabi-v7a.jar")],
+            ["url": "https://api.github.com/repos/bggRGjQaUbCoE/libmpv-android-video-build/releases/assets/512692510", "sha256": "40a9864988f1bd48301366b2a103c72d7220c13b88d9148e339727369b4758df", "destination": file("$buildDir/vnext-0bb7758/default-x86_64.jar")],
         ]
+
+        def calculateSHA256 = { target ->
+            MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(target.toPath())).encodeHex().toString()
+        }
 
         filesToDownload.each { fileInfo ->
             def destFile = fileInfo.destination
             if (destFile.exists()) {
-                def calculatedMD5 = MessageDigest.getInstance("MD5").digest(Files.readAllBytes(destFile.toPath())).encodeHex().toString()
+                def calculatedSHA256 = calculateSHA256(destFile)
 
-                if (calculatedMD5 != fileInfo.md5) {
+                if (calculatedSHA256 != fileInfo.sha256) {
                     destFile.delete()
-                    println "MD5 mismatch. File deleted: ${destFile}"
+                    println "SHA-256 mismatch. File deleted: ${destFile}"
                 }
 
             }
 
             if (!destFile.exists()) {
                 destFile.parentFile.mkdirs()
-                println "Downloading file from: ${fileInfo.url}"
-                destFile.withOutputStream { os ->
-                    os << new URL(fileInfo.url).openStream()
+                println "Downloading file from immutable asset: ${fileInfo.url}"
+                def connection = new URL(fileInfo.url).openConnection()
+                connection.setRequestProperty("Accept", "application/octet-stream")
+                connection.setRequestProperty("X-GitHub-Api-Version", "2022-11-28")
+                connection.setRequestProperty("User-Agent", "media-kit-gradle")
+                connection.setConnectTimeout(30000)
+                connection.setReadTimeout(120000)
+                connection.inputStream.withCloseable { input ->
+                    destFile.withOutputStream { output ->
+                        output << input
+                    }
                 }
 
-                def calculatedMD5 = MessageDigest.getInstance("MD5").digest(Files.readAllBytes(destFile.toPath())).encodeHex().toString()
-                if (calculatedMD5 != fileInfo.md5) {
-                    throw new GradleException("MD5 verification failed for ${destFile}")
+                def calculatedSHA256 = calculateSHA256(destFile)
+                if (calculatedSHA256 != fileInfo.sha256) {
+                    destFile.delete()
+                    throw new GradleException(
+                        "SHA-256 verification failed for ${destFile}: expected ${fileInfo.sha256}, got ${calculatedSHA256}"
+                    )
                 }
             }
 
