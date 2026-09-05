@@ -144,6 +144,7 @@ public class VideoOutput {
 
     public long createSurface() {
         synchronized (lock) {
+            logStartup("surface.create");
             pendingSurfaceTextureFrameGeneration = 0;
             pendingSurfaceTextureFrames = 0;
             // Delete previous android.view.Surface & object reference.
@@ -190,6 +191,7 @@ public class VideoOutput {
             pendingSurfaceTextureFrameWidth = width;
             pendingSurfaceTextureFrameHeight = height;
             pendingSurfaceTextureFrames = Math.max(1, minimumFrameCount);
+            logStartup("expectation.registered");
             if (!flutterJNIAPIAvailable) {
                 notifySurfaceTextureFrameAvailable();
             }
@@ -198,6 +200,7 @@ public class VideoOutput {
 
     public void cancelSurfaceTextureFrameExpectation() {
         synchronized (lock) {
+            logStartup("expectation.canceled");
             pendingSurfaceTextureFrameGeneration = 0;
             pendingSurfaceTextureFrames = 0;
         }
@@ -207,6 +210,7 @@ public class VideoOutput {
         synchronized (lock) {
             try {
                 if (!waitUntilFirstFrameRenderedNotify) {
+                    logStartup("first_frame.available");
                     waitUntilFirstFrameRenderedNotify = true;
                     final HashMap<String, Object> data = new HashMap<>();
                     data.put("handle", handle);
@@ -234,6 +238,7 @@ public class VideoOutput {
         if (generation == 0) {
             return;
         }
+        logStartup("frame.notification_sent");
         pendingSurfaceTextureFrameGeneration = 0;
         pendingSurfaceTextureFrames = 0;
 
@@ -246,6 +251,19 @@ public class VideoOutput {
                 "VideoOutput.SurfaceTextureFrameAvailable",
                 data
         );
+    }
+
+    // Only lifecycle/armed acknowledgement events, never every rendered frame.
+    private void logStartup(String event) {
+        try {
+            Log.i("PiliPlusStartup", String.format(Locale.ENGLISH,
+                    "layer=android_surface event=%s handle=%d generation=%d width=%d height=%d remainingFrames=%d flutterJNI=%s",
+                    event, handle, pendingSurfaceTextureFrameGeneration,
+                    pendingSurfaceTextureFrameWidth, pendingSurfaceTextureFrameHeight,
+                    pendingSurfaceTextureFrames, flutterJNIAPIAvailable));
+        } catch (Throwable ignored) {
+            // Diagnostics must not interfere with SurfaceTexture delivery.
+        }
     }
 
     private void clearSurface() {

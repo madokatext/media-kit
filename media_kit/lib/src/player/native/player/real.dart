@@ -6,6 +6,7 @@
 import 'dart:ffi';
 import 'dart:async';
 import 'dart:io';
+import 'dart:convert' show jsonEncode;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:media_kit/src/models/subtitle.dart';
@@ -48,6 +49,34 @@ void nativeEnsureInitialized({String? libmpv}) {
 ///
 /// {@endtemplate}
 class NativePlayer extends PlatformPlayer {
+  final Stopwatch _startupDiagnosticClock = Stopwatch();
+  int _diagnosticLoad = 0;
+
+  void _logStartup(String event, [Map<String, Object?> details = const {}]) {
+    if (!Platform.isAndroid || !_startupDiagnosticClock.isRunning ||
+        _startupDiagnosticClock.elapsedMilliseconds > 20000) return;
+    try {
+      // This package also runs without Flutter. stdout is captured by logcat
+      // in the Android app, including release builds.
+      print('[PiliPlusStartup] ${jsonEncode({
+        'layer': 'native_player',
+        'event': event,
+        'time': DateTime.now().toIso8601String(),
+        'handle': handle.toString(),
+        'load': _diagnosticLoad,
+        'elapsedMs': _startupDiagnosticClock.elapsedMilliseconds,
+        'playing': state.playing,
+        'buffering': state.buffering,
+        'completed': state.completed,
+        'allowPlayingChange': isPlayingStateChangeAllowed,
+        'allowBufferingChange': isBufferingStateChangeAllowed,
+        ...details,
+      })}');
+    } catch (_) {
+      // Never interrupt the native event loop for diagnostic failures.
+    }
+  }
+
   /// {@macro native_player}
   NativePlayer._({required super.configuration}) {
     _future = _create();
@@ -293,7 +322,9 @@ class NativePlayer extends PlatformPlayer {
   /// Starts playing the [Player].
   @override
   Future<void> play({bool synchronized = true}) {
+    _logStartup('play.queued', {'synchronized': synchronized});
     Future<void> function() async {
+      _logStartup('play.enter');
       throwIfDisposed();
 
       state.playing = true;
@@ -309,6 +340,7 @@ class NativePlayer extends PlatformPlayer {
         await _setPropertyInt64('playlist-pos', 0);
       }
       await _setPropertyFlag('pause', false);
+      _logStartup('play.unpause_completed');
     }
 
     if (synchronized) {
@@ -996,6 +1028,18 @@ class NativePlayer extends PlatformPlayer {
 
     _error(event.ref.error);
 
+    if (eventId == generated.mpv_event_id.MPV_EVENT_START_FILE) {
+      _diagnosticLoad++;
+      _startupDiagnosticClock..reset()..start();
+      _logStartup('start_file');
+    } else if (eventId == generated.mpv_event_id.MPV_EVENT_FILE_LOADED) {
+      _logStartup('file_loaded');
+    } else if (eventId == generated.mpv_event_id.MPV_EVENT_PLAYBACK_RESTART) {
+      _logStartup('playback_restart');
+    } else if (eventId == generated.mpv_event_id.MPV_EVENT_END_FILE) {
+      _logStartup('end_file', {'error': event.ref.error});
+    }
+
     switch (eventId) {
       case generated.mpv_event_id.MPV_EVENT_START_FILE:
         if (isPlayingStateChangeAllowed) {
@@ -1013,6 +1057,7 @@ class NativePlayer extends PlatformPlayer {
         if (!bufferingController.isClosed) {
           bufferingController.add(true);
         }
+        _logStartup('start_file.buffering_set');
       // NOTE: Now, --keep-open=yes is used. Thus, eof-reached property is used instead of this.
       // case generated.mpv_event_id.MPV_EVENT_END_FILE:
       //   // Check for mpv_end_file_reason.MPV_END_FILE_REASON_EOF before modifying state.completed.
@@ -1040,11 +1085,13 @@ class NativePlayer extends PlatformPlayer {
                   playingController.add(playing);
                 }
               }
+              _logStartup('property.pause', {'value': !playing});
             }
           case 'core-idle':
             if (prop.ref.format == generated.mpv_format.MPV_FORMAT_FLAG) {
               // Check for [isBufferingStateChangeAllowed] because `pause` causes `core-idle` to be fired.
               final buffering = prop.ref.data.cast<Int8>().value == 1;
+              final changeAllowedBefore = isBufferingStateChangeAllowed;
               if (buffering) {
                 if (isBufferingStateChangeAllowed) {
                   state.buffering = true;
@@ -1059,6 +1106,10 @@ class NativePlayer extends PlatformPlayer {
                 }
               }
               isBufferingStateChangeAllowed = true;
+              _logStartup('property.core_idle', {
+                'value': buffering,
+                'changeAllowedBefore': changeAllowedBefore,
+              });
             }
           case 'paused-for-cache':
             if (prop.ref.format == generated.mpv_format.MPV_FORMAT_FLAG) {
@@ -1067,6 +1118,7 @@ class NativePlayer extends PlatformPlayer {
               if (!bufferingController.isClosed) {
                 bufferingController.add(buffering);
               }
+              _logStartup('property.paused_for_cache', {'value': buffering});
             }
           case 'demuxer-cache-time':
             if (prop.ref.format == generated.mpv_format.MPV_FORMAT_DOUBLE) {

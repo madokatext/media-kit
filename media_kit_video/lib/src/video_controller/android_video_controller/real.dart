@@ -6,6 +6,7 @@
 import 'dart:io';
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert' show jsonEncode;
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import 'package:synchronized/synchronized.dart';
@@ -45,6 +46,45 @@ class AndroidVideoController extends PlatformVideoController {
   int? _pendingSurfaceWidth;
   int? _pendingSurfaceHeight;
   Completer<void> _currentMediaFirstFrameRendered = Completer<void>();
+  int _diagnosticMediaGeneration = 0;
+  final Stopwatch _diagnosticClock = Stopwatch()..start();
+  int _layoutDiagnosticCount = 0;
+
+  // Startup-only, release-enabled diagnostics. No stream URLs or headers.
+  void _logStartup(String event, [Map<String, Object?> details = const {}]) {
+    if (_diagnosticClock.elapsedMilliseconds > 20000) return;
+    try {
+      // Dragging layouts can call setSize every frame. Preserve all rejection
+      // and cancellation events while bounding verbose layout diagnostics.
+      if (event.startsWith('set_size.') || event == 'video_params') {
+        if (_layoutDiagnosticCount++ >= 24) return;
+      }
+      debugPrintSynchronously('[PiliPlusStartup] ${jsonEncode({
+        'layer': 'surface',
+        'event': event,
+        'time': DateTime.now().toIso8601String(),
+        'handle': player.handle.toString(),
+        'mediaGeneration': _diagnosticMediaGeneration,
+        'elapsedMs': _diagnosticClock.elapsedMilliseconds,
+        'vo': vo,
+        'wid': _wid,
+        'attached': _surfaceAttached,
+        'generation': _surfaceSizeGeneration,
+        'pendingGeneration': _pendingSurfaceSizeGeneration,
+        'pendingWidth': _pendingSurfaceWidth,
+        'pendingHeight': _pendingSurfaceHeight,
+        'surfaceWidth': _surfaceWidth,
+        'surfaceHeight': _surfaceHeight,
+        'sourceWidth': _sourceWidth,
+        'sourceHeight': _sourceHeight,
+        'firstFrameCompleted': _currentMediaFirstFrameRendered.isCompleted,
+        'firstFrameFutureId': identityHashCode(_currentMediaFirstFrameRendered.future),
+        ...details,
+      })}');
+    } catch (_) {
+      // Logging cannot interfere with surface setup or frame acknowledgements.
+    }
+  }
 
   // ----------------------------------------------
 
@@ -83,7 +123,11 @@ class AndroidVideoController extends PlatformVideoController {
     height = configuration.height;
 
     player.onLoadHooks.add(() {
+      _diagnosticClock.reset();
+      _layoutDiagnosticCount = 0;
+      _logStartup('load_hook.queued');
       return _lock.synchronized(() async {
+        _logStartup('load_hook.enter');
         final mpv = NativePlayer.mpv;
         final ctx = player.ctx;
 
@@ -95,11 +139,12 @@ class AndroidVideoController extends PlatformVideoController {
         mpv.mpv_free(path.cast());
 
         if (_current != current) {
+          _logStartup('load_hook.new_resource');
           _current = current;
           _surfaceAttached = false;
           _surfaceWidth = null;
           _surfaceHeight = null;
-          _invalidatePendingSurfaceSize();
+          _invalidatePendingSurfaceSize('load_hook');
           // It is important to use a new android.view.Surface each time a new video-output is created because: https://stackoverflow.com/a/21564236
           // Not doing so will cause MediaCodec usage inside libavcodec to incorrectly fail with error (because this android.view.Surface would be used twice):
           // "native_window_api_connect returned an error: Invalid argument (-22)" & next less-efficient hwdec will be used redundantly.
@@ -113,6 +158,7 @@ class AndroidVideoController extends PlatformVideoController {
           debugPrint(data.toString());
           // Save the android.view.Surface object reference for usage inside player.stream.videoParams.listen.
           _wid = data['wid'];
+          _logStartup('load_hook.surface_created');
         }
 
         // By default, android.view.Surface has a size of 1x1. If we assign --wid here, libmpv will internally start rendering & the first frame will be drawn as a solid color: https://github.com/media-kit/media-kit/issues/339
@@ -135,10 +181,11 @@ class AndroidVideoController extends PlatformVideoController {
     });
     player.onUnloadHooks.add(() {
       return _lock.synchronizedSync(() {
+        _logStartup('unload_hook');
         _surfaceAttached = false;
         _surfaceWidth = null;
         _surfaceHeight = null;
-        _invalidatePendingSurfaceSize();
+        _invalidatePendingSurfaceSize('unload_hook');
         // Release any references to current android.view.Surface.
         //
         // It is important to set --vo=null here for 2 reasons:
@@ -158,6 +205,9 @@ class AndroidVideoController extends PlatformVideoController {
 
     _subscription = player.stream.videoParams.listen(
       (event) => _lock.synchronized(() async {
+        _logStartup('video_params', {
+          'dw': event.dw, 'dh': event.dh, 'rotate': event.rotate,
+        });
         if (const [0, null].contains(event.dw) ||
             const [0, null].contains(event.dh) ||
             _wid == null) {
@@ -210,6 +260,7 @@ class AndroidVideoController extends PlatformVideoController {
               player.setOption('wid', _wid.toString());
               player.setOption('vo', 'gpu');
               _surfaceAttached = true;
+              _logStartup('surface.attached');
             } else if (!_rectMatches(width, height) &&
                 (_pendingSurfaceWidth != width ||
                     _pendingSurfaceHeight != height)) {
@@ -310,7 +361,15 @@ class AndroidVideoController extends PlatformVideoController {
       throw ArgumentError('width & height must be null or positive.');
     }
 
+    _logStartup('set_size.queued', {
+      'requestedWidth': width, 'requestedHeight': height,
+      'waitForFrame': waitForFrame,
+    });
     await _lock.synchronized(() async {
+      _logStartup('set_size.enter', {
+        'requestedWidth': width, 'requestedHeight': height,
+        'waitForFrame': waitForFrame,
+      });
       this.width = width;
       this.height = height;
 
@@ -319,11 +378,12 @@ class AndroidVideoController extends PlatformVideoController {
         // Ordinary layout changes must remain responsive. Invalidate the
         // Dart generation before crossing the platform channel so an
         // already queued acknowledgement cannot publish an obsolete size.
-        _invalidatePendingSurfaceSize();
+        _invalidatePendingSurfaceSize('set_size_without_frame_wait');
         await _channel.invokeMethod<void>(
           'VideoOutputManager.CancelSurfaceTextureFrameExpectation',
           {'handle': player.handle.toString()},
         );
+        _logStartup('expectation.cancel_sent');
       }
 
       final outputWidth = _outputWidth;
@@ -381,10 +441,15 @@ class AndroidVideoController extends PlatformVideoController {
 
   @override
   Future<void> armWaitUntilFirstFrameRendered() {
+    _diagnosticMediaGeneration++;
+    _diagnosticClock.reset();
+    _layoutDiagnosticCount = 0;
+    _logStartup('first_frame.arm');
     if (vo != 'gpu') {
       return super.armWaitUntilFirstFrameRendered();
     }
     _currentMediaFirstFrameRendered = Completer<void>();
+    _logStartup('first_frame.armed');
     return _currentMediaFirstFrameRendered.future;
   }
 
@@ -397,6 +462,7 @@ class AndroidVideoController extends PlatformVideoController {
     _pendingSurfaceSizeGeneration = generation;
     _pendingSurfaceWidth = width;
     _pendingSurfaceHeight = height;
+    _logStartup('expectation.before', {'minimumFrameCount': minimumFrameCount});
 
     try {
       await _channel.invokeMethod<void>(
@@ -409,7 +475,12 @@ class AndroidVideoController extends PlatformVideoController {
           'minimumFrameCount': minimumFrameCount.toString(),
         },
       );
-    } catch (_) {
+      _logStartup('expectation.registered', {'requestedGeneration': generation});
+    } catch (error) {
+      _logStartup('expectation.error', {
+        'requestedGeneration': generation,
+        'errorType': error.runtimeType.toString(),
+      });
       if (_pendingSurfaceSizeGeneration == generation) {
         _pendingSurfaceSizeGeneration = null;
         _pendingSurfaceWidth = null;
@@ -432,25 +503,41 @@ class AndroidVideoController extends PlatformVideoController {
         _pendingSurfaceHeight != height ||
         _surfaceWidth != width ||
         _surfaceHeight != height) {
+      _logStartup('frame.rejected', {
+        'receivedGeneration': generation,
+        'receivedWidth': width,
+        'receivedHeight': height,
+        'blockers': [
+          if (_pendingSurfaceSizeGeneration != generation) 'generation',
+          if (_pendingSurfaceWidth != width) 'pending_width',
+          if (_pendingSurfaceHeight != height) 'pending_height',
+          if (_surfaceWidth != width) 'surface_width',
+          if (_surfaceHeight != height) 'surface_height',
+        ],
+      });
       return;
     }
 
+    _logStartup('frame.accepted', {'receivedGeneration': generation});
     _pendingSurfaceSizeGeneration = null;
     _pendingSurfaceWidth = null;
     _pendingSurfaceHeight = null;
     if (!_currentMediaFirstFrameRendered.isCompleted) {
       _currentMediaFirstFrameRendered.complete();
+      _logStartup('first_frame.completed');
     }
     _publishSurfaceSize(width, height);
   }
 
   void _notifyFirstFrameRendered() {
+    _logStartup('legacy_first_frame.received');
     if (!waitUntilFirstFrameRenderedCompleter.isCompleted) {
       waitUntilFirstFrameRenderedCompleter.complete();
     }
   }
 
-  void _invalidatePendingSurfaceSize() {
+  void _invalidatePendingSurfaceSize(String reason) {
+    _logStartup('expectation.invalidated', {'reason': reason});
     _surfaceSizeGeneration++;
     _pendingSurfaceSizeGeneration = null;
     _pendingSurfaceWidth = null;
@@ -537,7 +624,14 @@ class AndroidVideoController extends PlatformVideoController {
                 final int generation = call.arguments['generation'];
                 final int width = call.arguments['width'];
                 final int height = call.arguments['height'];
-                _controllers[handle]?._notifySurfaceTextureFrame(
+                final controller = _controllers[handle];
+                if (controller == null) {
+                  debugPrintSynchronously(
+                    '[PiliPlusStartup] layer=surface event=frame.missing_controller '
+                    'handle=$handle generation=$generation width=$width height=$height',
+                  );
+                }
+                controller?._notifySurfaceTextureFrame(
                   generation,
                   width,
                   height,
