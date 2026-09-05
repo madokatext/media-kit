@@ -41,7 +41,10 @@ class AndroidVideoController extends PlatformVideoController {
   int? _surfaceWidth;
   int? _surfaceHeight;
   bool _surfaceAttached = false;
+  int _mediaEpoch = 0;
+  bool _mediaActive = false;
   int _surfaceSizeGeneration = 0;
+  int? _pendingMediaEpoch;
   int? _pendingSurfaceSizeGeneration;
   int? _pendingSurfaceWidth;
   int? _pendingSurfaceHeight;
@@ -65,6 +68,9 @@ class AndroidVideoController extends PlatformVideoController {
         'time': DateTime.now().toIso8601String(),
         'handle': player.handle.toString(),
         'mediaGeneration': _diagnosticMediaGeneration,
+        'mediaEpoch': _mediaEpoch,
+        'mediaActive': _mediaActive,
+        'pendingMediaEpoch': _pendingMediaEpoch,
         'elapsedMs': _diagnosticClock.elapsedMilliseconds,
         'vo': vo,
         'wid': _wid,
@@ -123,22 +129,24 @@ class AndroidVideoController extends PlatformVideoController {
     height = configuration.height;
 
     player.onLoadHooks.add(() {
+      final mediaEpoch = _invalidateMediaOutput('load_hook');
       _diagnosticClock.reset();
       _layoutDiagnosticCount = 0;
       _logStartup('load_hook.queued');
       return _lock.synchronized(() async {
+        if (mediaEpoch != _mediaEpoch) return;
         _logStartup('load_hook.enter');
         final mpv = NativePlayer.mpv;
         final ctx = player.ctx;
 
-        // Skip surface re-creation if same resource.
+        // An unloaded Surface is never reused, even for the same URL.
         final name = 'path'.toNativeUtf8();
         final path = mpv.mpv_get_property_string(ctx, name);
         final current = path.toDartString();
         calloc.free(name.cast());
         mpv.mpv_free(path.cast());
 
-        if (_current != current) {
+        if (_current != current || _wid == null) {
           _logStartup('load_hook.new_resource');
           _current = current;
           _surfaceAttached = false;
@@ -155,6 +163,7 @@ class AndroidVideoController extends PlatformVideoController {
             'VideoOutputManager.CreateSurface',
             {'handle': ctx.address.toString()},
           );
+          if (mediaEpoch != _mediaEpoch) return;
           debugPrint(data.toString());
           // Save the android.view.Surface object reference for usage inside player.stream.videoParams.listen.
           _wid = data['wid'];
@@ -177,15 +186,26 @@ class AndroidVideoController extends PlatformVideoController {
           debugPrint(exception.toString());
           debugPrint(stacktrace.toString());
         }
+        // on_load runs before the new file's decoder starts. Until this hook
+        // finishes, queued video parameters still belong to the old output.
+        _sourceWidth = null;
+        _sourceHeight = null;
+        _mediaActive = true;
+        _logStartup('load_hook.ready');
       });
     });
     player.onUnloadHooks.add(() {
+      // Invalidate synchronously, BEFORE waiting for a layout/platform call
+      // already holding _lock. Its continuation must not reattach the old VO.
+      final mediaEpoch = _invalidateMediaOutput('unload_hook');
       return _lock.synchronizedSync(() {
+        if (mediaEpoch != _mediaEpoch) return;
         _logStartup('unload_hook');
         _surfaceAttached = false;
         _surfaceWidth = null;
         _surfaceHeight = null;
         _invalidatePendingSurfaceSize('unload_hook');
+        _wid = null;
         // Release any references to current android.view.Surface.
         //
         // It is important to set --vo=null here for 2 reasons:
@@ -204,83 +224,93 @@ class AndroidVideoController extends PlatformVideoController {
     });
 
     _subscription = player.stream.videoParams.listen(
-      (event) => _lock.synchronized(() async {
-        _logStartup('video_params', {
-          'dw': event.dw, 'dh': event.dh, 'rotate': event.rotate,
-        });
-        if (const [0, null].contains(event.dw) ||
-            const [0, null].contains(event.dh) ||
-            _wid == null) {
+      (event) async {
+        final mediaEpoch = _mediaEpoch;
+        if (!_mediaActive) {
+          _logStartup('video_params.ignored', {'reason': 'media_inactive'});
           return;
         }
-
-        final int width;
-        final int height;
-        if (event.rotate == 0 || event.rotate == 180) {
-          _sourceWidth = event.dw ?? 0;
-          _sourceHeight = event.dh ?? 0;
-        } else {
-          // width & height are swapped for 90 or 270 degrees rotation.
-          _sourceWidth = event.dh ?? 0;
-          _sourceHeight = event.dw ?? 0;
-        }
-
-        width = vo == 'gpu' ? _outputWidth! : _sourceWidth!;
-        height = vo == 'gpu' ? _outputHeight! : _sourceHeight!;
-        final surfaceWasAttached = _surfaceAttached;
-        try {
-          if (vo == 'gpu') {
-            if (_surfaceWidth != width || _surfaceHeight != height) {
-              await _channel.invokeMethod(
-                'VideoOutputManager.SetSurfaceTextureSize',
-                {
-                  'handle': player.handle.toString(),
-                  'width': width.toString(),
-                  'height': height.toString(),
-                },
-              );
-              if (surfaceWasAttached) {
-                player.setProperty('android-surface-size', '${width}x$height');
-              } else {
-                player.setOption('android-surface-size', '${width}x$height');
-              }
-              _surfaceWidth = width;
-              _surfaceHeight = height;
-            }
-
-            if (!_surfaceAttached) {
-              // Arm the notification before attaching the surface so the
-              // first real video frame cannot arrive between attachment and
-              // registration.
-              await _expectSurfaceTextureFrame(
-                width,
-                height,
-                minimumFrameCount: 1,
-              );
-              player.setOption('wid', _wid.toString());
-              player.setOption('vo', 'gpu');
-              _surfaceAttached = true;
-              _logStartup('surface.attached');
-            } else if (!_rectMatches(width, height) &&
-                (_pendingSurfaceWidth != width ||
-                    _pendingSurfaceHeight != height)) {
-              // Media reconfiguration only needs the first frame produced
-              // for the new video parameters.
-              await _expectSurfaceTextureFrame(
-                width,
-                height,
-                minimumFrameCount: 1,
-              );
-            }
+        await _lock.synchronized(() async {
+          if (!_isCurrentMedia(mediaEpoch)) return;
+          _logStartup('video_params', {
+            'dw': event.dw, 'dh': event.dh, 'rotate': event.rotate,
+          });
+          if (const [0, null].contains(event.dw) ||
+              const [0, null].contains(event.dh) ||
+              _wid == null) {
+            return;
           }
-        } catch (exception, stacktrace) {
-          debugPrint(exception.toString());
-          debugPrint(stacktrace.toString());
-        }
-        if (vo != 'gpu') {
-          _publishSurfaceSize(width, height);
-        }
-      }),
+
+          final int width;
+          final int height;
+          if (event.rotate == 0 || event.rotate == 180) {
+            _sourceWidth = event.dw ?? 0;
+            _sourceHeight = event.dh ?? 0;
+          } else {
+            // width & height are swapped for 90 or 270 degrees rotation.
+            _sourceWidth = event.dh ?? 0;
+            _sourceHeight = event.dw ?? 0;
+          }
+
+          width = vo == 'gpu' ? _outputWidth! : _sourceWidth!;
+          height = vo == 'gpu' ? _outputHeight! : _sourceHeight!;
+          final surfaceWasAttached = _surfaceAttached;
+          try {
+            if (vo == 'gpu') {
+              if (_surfaceWidth != width || _surfaceHeight != height) {
+                await _channel.invokeMethod(
+                  'VideoOutputManager.SetSurfaceTextureSize',
+                  {
+                    'handle': player.handle.toString(),
+                    'width': width.toString(),
+                    'height': height.toString(),
+                  },
+                );
+                if (!_isCurrentMedia(mediaEpoch)) return;
+                if (surfaceWasAttached) {
+                  player.setProperty('android-surface-size', '${width}x$height');
+                } else {
+                  player.setOption('android-surface-size', '${width}x$height');
+                }
+                _surfaceWidth = width;
+                _surfaceHeight = height;
+              }
+
+              if (!_surfaceAttached) {
+                // Arm the notification before attaching the surface so the
+                // first real video frame cannot arrive between attachment and
+                // registration.
+                final expected = await _expectSurfaceTextureFrame(
+                  width,
+                  height,
+                  minimumFrameCount: 1,
+                );
+                if (!expected || !_isCurrentMedia(mediaEpoch)) return;
+                player.setOption('wid', _wid.toString());
+                player.setOption('vo', 'gpu');
+                _surfaceAttached = true;
+                _logStartup('surface.attached');
+              } else if (!_rectMatches(width, height) &&
+                  (_pendingSurfaceWidth != width ||
+                      _pendingSurfaceHeight != height)) {
+                // Media reconfiguration only needs the first frame produced
+                // for the new video parameters.
+                await _expectSurfaceTextureFrame(
+                  width,
+                  height,
+                  minimumFrameCount: 1,
+                );
+              }
+            }
+          } catch (exception, stacktrace) {
+            debugPrint(exception.toString());
+            debugPrint(stacktrace.toString());
+          }
+          if (vo != 'gpu') {
+            _publishSurfaceSize(width, height);
+          }
+        });
+      },
     );
   }
 
@@ -372,6 +402,8 @@ class AndroidVideoController extends PlatformVideoController {
       });
       this.width = width;
       this.height = height;
+      final mediaEpoch = _mediaEpoch;
+      if (!_mediaActive) return;
 
       if (!waitForFrame &&
           _pendingSurfaceSizeGeneration != null) {
@@ -383,6 +415,7 @@ class AndroidVideoController extends PlatformVideoController {
           'VideoOutputManager.CancelSurfaceTextureFrameExpectation',
           {'handle': player.handle.toString()},
         );
+        if (!_isCurrentMedia(mediaEpoch)) return;
         _logStartup('expectation.cancel_sent');
       }
 
@@ -405,6 +438,7 @@ class AndroidVideoController extends PlatformVideoController {
             'height': outputHeight.toString(),
           },
         );
+        if (!_isCurrentMedia(mediaEpoch)) return;
         player.setProperty(
           'android-surface-size',
           '${outputWidth}x$outputHeight',
@@ -448,17 +482,21 @@ class AndroidVideoController extends PlatformVideoController {
     if (vo != 'gpu') {
       return super.armWaitUntilFirstFrameRendered();
     }
+    _invalidateMediaOutput('first_frame.arm');
     _currentMediaFirstFrameRendered = Completer<void>();
     _logStartup('first_frame.armed');
     return _currentMediaFirstFrameRendered.future;
   }
 
-  Future<void> _expectSurfaceTextureFrame(
+  Future<bool> _expectSurfaceTextureFrame(
     int width,
     int height, {
     required int minimumFrameCount,
   }) async {
+    final mediaEpoch = _mediaEpoch;
+    if (!_mediaActive) return false;
     final generation = ++_surfaceSizeGeneration;
+    _pendingMediaEpoch = mediaEpoch;
     _pendingSurfaceSizeGeneration = generation;
     _pendingSurfaceWidth = width;
     _pendingSurfaceHeight = height;
@@ -475,18 +513,23 @@ class AndroidVideoController extends PlatformVideoController {
           'minimumFrameCount': minimumFrameCount.toString(),
         },
       );
+      if (!_isCurrentMedia(mediaEpoch)) return false;
       _logStartup('expectation.registered', {'requestedGeneration': generation});
+      return true;
     } catch (error) {
       _logStartup('expectation.error', {
         'requestedGeneration': generation,
         'errorType': error.runtimeType.toString(),
       });
       if (_pendingSurfaceSizeGeneration == generation) {
+        _pendingMediaEpoch = null;
         _pendingSurfaceSizeGeneration = null;
         _pendingSurfaceWidth = null;
         _pendingSurfaceHeight = null;
       }
-      if (_surfaceWidth == width && _surfaceHeight == height) {
+      if (_isCurrentMedia(mediaEpoch) &&
+          _surfaceWidth == width &&
+          _surfaceHeight == height) {
         _publishSurfaceSize(width, height);
       }
       rethrow;
@@ -498,7 +541,9 @@ class AndroidVideoController extends PlatformVideoController {
     int width,
     int height,
   ) {
-    if (_pendingSurfaceSizeGeneration != generation ||
+    if (!_mediaActive ||
+        _pendingMediaEpoch != _mediaEpoch ||
+        _pendingSurfaceSizeGeneration != generation ||
         _pendingSurfaceWidth != width ||
         _pendingSurfaceHeight != height ||
         _surfaceWidth != width ||
@@ -508,6 +553,8 @@ class AndroidVideoController extends PlatformVideoController {
         'receivedWidth': width,
         'receivedHeight': height,
         'blockers': [
+          if (!_mediaActive) 'media_inactive',
+          if (_pendingMediaEpoch != _mediaEpoch) 'media_epoch',
           if (_pendingSurfaceSizeGeneration != generation) 'generation',
           if (_pendingSurfaceWidth != width) 'pending_width',
           if (_pendingSurfaceHeight != height) 'pending_height',
@@ -519,6 +566,7 @@ class AndroidVideoController extends PlatformVideoController {
     }
 
     _logStartup('frame.accepted', {'receivedGeneration': generation});
+    _pendingMediaEpoch = null;
     _pendingSurfaceSizeGeneration = null;
     _pendingSurfaceWidth = null;
     _pendingSurfaceHeight = null;
@@ -539,9 +587,19 @@ class AndroidVideoController extends PlatformVideoController {
   void _invalidatePendingSurfaceSize(String reason) {
     _logStartup('expectation.invalidated', {'reason': reason});
     _surfaceSizeGeneration++;
+    _pendingMediaEpoch = null;
     _pendingSurfaceSizeGeneration = null;
     _pendingSurfaceWidth = null;
     _pendingSurfaceHeight = null;
+  }
+
+  bool _isCurrentMedia(int epoch) => _mediaActive && epoch == _mediaEpoch;
+
+  int _invalidateMediaOutput(String reason) {
+    _mediaActive = false;
+    _mediaEpoch++;
+    _invalidatePendingSurfaceSize(reason);
+    return _mediaEpoch;
   }
 
   bool _rectMatches(int width, int height) {
@@ -578,6 +636,7 @@ class AndroidVideoController extends PlatformVideoController {
 
   /// Disposes the instance. Releases allocated resources back to the system.
   Future<void> _dispose() async {
+    _invalidateMediaOutput('dispose');
     // Dispose the [StreamSubscription]s.
     await _subscription?.cancel();
     // Release the native resources.
